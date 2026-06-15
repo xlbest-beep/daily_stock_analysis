@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -254,6 +255,7 @@ class AlertWorkerTestCase(unittest.TestCase):
         return SimpleNamespace(
             agent_event_monitor_enabled=True,
             agent_event_alert_rules_json=raw_rules,
+            trading_day_check_enabled=False,
         )
 
     def _create_rule(self, **overrides) -> dict:
@@ -312,6 +314,43 @@ class AlertWorkerTestCase(unittest.TestCase):
         else:
             notifier.send_with_results.side_effect = list(results)
         return notifier
+
+    def test_triggered_diagnostics_merge_visibility_and_market_scope_uses_region(self) -> None:
+        worker = AlertWorker(config_provider=lambda: self._config(), service=self.service)
+        runtime_rule = SimpleNamespace(
+            target_scope="market",
+            target="cn",
+            effective_target="cn",
+        )
+        result = {
+            "status": "triggered",
+            "diagnostics": '{"existing":"keep"}',
+        }
+
+        with patch(
+            "src.services.alert_worker.build_market_phase_context",
+            return_value={
+                "phase": "intraday",
+                "market": "cn",
+                "trigger_source": "alert",
+                "is_trading_day": True,
+                "is_partial_bar": True,
+            },
+        ) as build_context, patch(
+            "src.services.alert_worker.get_market_for_stock",
+            side_effect=AssertionError("market scope must not infer stock market"),
+        ):
+            diagnostics = worker._diagnostics_for_status("triggered", result, runtime_rule)
+
+        payload = json.loads(diagnostics)
+        self.assertEqual(payload["existing"], "keep")
+        visibility = payload["analysis_visibility"]
+        self.assertEqual(visibility["source"], "alert_trigger_market_context")
+        self.assertEqual(visibility["market_phase_summary"]["phase"], "intraday")
+        self.assertEqual(visibility["market_phase_summary"]["market"], "cn")
+        self.assertTrue(visibility["market_phase_summary"]["is_partial_bar"])
+        build_context.assert_called_once()
+        self.assertEqual(build_context.call_args.kwargs["market"], "cn")
 
     def test_enabled_db_rule_triggers_and_disabled_rule_is_ignored(self) -> None:
         enabled_rule = self._create_rule(target="600519")
@@ -994,6 +1033,77 @@ class AlertWorkerTestCase(unittest.TestCase):
         self.assertEqual(stats["loaded"], 0)
         self.assertEqual(stats["evaluated"], 0)
         self.assertEqual(self._triggers(), [])
+
+    def test_market_light_rule_triggers_with_market_payload_and_deduplicates_trade_date(self) -> None:
+        rule = self._create_rule(
+            name="Market risk-off",
+            target_scope="market",
+            target="cn",
+            alert_type="market_light_status",
+            parameters={"statuses": ["red", "yellow"]},
+        )
+        snapshot = {
+            "region": "cn",
+            "trade_date": "2026-03-07",
+            "status": "red",
+            "score": 35,
+            "label": "偏防守",
+            "temperature_label": "偏弱",
+            "reasons": ["test"],
+            "guidance": "test",
+            "dimensions": {
+                "breadth": {"score": 20, "available": True},
+                "index": {"score": 30, "available": True},
+                "limit": {"score": 10, "available": True},
+            },
+            "data_quality": "ok",
+        }
+        notifier = self._notifier()
+        worker = AlertWorker(config_provider=lambda: self._config(), service=self.service, notifier=notifier)
+
+        with patch("src.services.market_light_alerts.build_current_snapshot", return_value=snapshot):
+            first = worker.run_once()
+            second = worker.run_once()
+
+        self.assertEqual(first["triggered"], 1)
+        self.assertEqual(first["recorded"], 1)
+        self.assertEqual(second["triggered"], 1)
+        self.assertEqual(second["recorded"], 0)
+        notifier.send_with_results.assert_called_once()
+        self.assertEqual(notifier.send_with_results.call_args.kwargs["route_type"], "alert")
+        triggers = self._triggers(rule_id=rule["id"], status="triggered")
+        self.assertEqual(len(triggers), 1)
+        self.assertEqual(triggers[0]["target"], "cn")
+        self.assertEqual(triggers[0]["observed_value"], 35.0)
+        self.assertEqual(triggers[0]["data_source"], "market_light")
+        self.assertEqual(triggers[0]["data_timestamp"], "2026-03-07T00:00:00")
+
+    def test_market_light_rule_skips_non_trading_day_when_check_enabled(self) -> None:
+        self._create_rule(
+            name="Market risk-off",
+            target_scope="market",
+            target="cn",
+            alert_type="market_light_status",
+            parameters={"statuses": ["red"]},
+        )
+        config = SimpleNamespace(
+            agent_event_monitor_enabled=True,
+            agent_event_alert_rules_json="",
+            trading_day_check_enabled=True,
+        )
+        worker = AlertWorker(config_provider=lambda: config, service=self.service)
+
+        with patch("src.services.market_light_alerts.get_open_markets_today", return_value=set()), patch(
+            "src.services.market_light_alerts.build_current_snapshot"
+        ) as build_snapshot:
+            stats = worker.run_once()
+
+        self.assertEqual(stats["skipped"], 1)
+        build_snapshot.assert_not_called()
+        triggers = self._triggers(status="skipped")
+        self.assertEqual(len(triggers), 1)
+        self.assertEqual(triggers[0]["target"], "cn")
+        self.assertEqual(triggers[0]["data_source"], "market_light")
 
     def test_single_rule_failure_does_not_block_other_rules(self) -> None:
         self._create_rule(target="600519")

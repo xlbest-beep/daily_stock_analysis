@@ -1,5 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { UiLanguageProvider } from '../../../contexts/UiLanguageContext';
+import { UI_LANGUAGE_STORAGE_KEY } from '../../../utils/uiLanguage';
 import { AlertRuleForm } from '../AlertRuleForm';
 
 const { getAccounts } = vi.hoisted(() => ({
@@ -19,8 +21,18 @@ describe('AlertRuleForm', () => {
     onSubmit.mockReset();
     onSubmit.mockResolvedValue(undefined);
     getAccounts.mockReset();
+    window.localStorage.clear();
     getAccounts.mockResolvedValue({ accounts: [{ id: 9, name: 'Main', market: 'us', baseCurrency: 'USD', isActive: true }] });
   });
+
+  function renderEnglishForm() {
+    window.localStorage.setItem(UI_LANGUAGE_STORAGE_KEY, 'en');
+    render(
+      <UiLanguageProvider>
+        <AlertRuleForm onSubmit={onSubmit} />
+      </UiLanguageProvider>,
+    );
+  }
 
   it('submits a price_cross rule payload', async () => {
     render(<AlertRuleForm onSubmit={onSubmit} />);
@@ -206,6 +218,54 @@ describe('AlertRuleForm', () => {
         target: '9',
         alertType: 'portfolio_stop_loss',
         parameters: { mode: 'breach' },
+      }));
+    });
+  });
+
+  it('renders portfolio alert type options in English UI mode', async () => {
+    renderEnglishForm();
+
+    fireEvent.change(screen.getByLabelText('Target scope'), { target: { value: 'portfolio_account' } });
+
+    await waitFor(() => expect(getAccounts).toHaveBeenCalledWith(false));
+    expect(screen.getByRole('option', { name: 'Portfolio drawdown' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Portfolio stop loss' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Info' })).toBeInTheDocument();
+    expect(screen.queryByText('组合回撤')).not.toBeInTheDocument();
+  });
+
+  it('submits a market light status rule payload', async () => {
+    render(<AlertRuleForm onSubmit={onSubmit} />);
+
+    fireEvent.change(screen.getByLabelText('目标范围'), { target: { value: 'market' } });
+    fireEvent.change(screen.getByLabelText('市场区域'), { target: { value: 'hk' } });
+    fireEvent.click(screen.getByRole('button', { name: '创建规则' }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+        targetScope: 'market',
+        target: 'hk',
+        alertType: 'market_light_status',
+        parameters: { statuses: ['red', 'yellow'] },
+      }));
+    });
+  });
+
+  it('submits a market light score-drop rule payload', async () => {
+    render(<AlertRuleForm onSubmit={onSubmit} />);
+
+    fireEvent.change(screen.getByLabelText('目标范围'), { target: { value: 'market' } });
+    fireEvent.change(screen.getByLabelText('市场区域'), { target: { value: 'us' } });
+    fireEvent.change(screen.getByLabelText('规则类型'), { target: { value: 'market_light_score_drop' } });
+    fireEvent.change(screen.getByLabelText('Score 下降阈值'), { target: { value: '12' } });
+    fireEvent.click(screen.getByRole('button', { name: '创建规则' }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+        targetScope: 'market',
+        target: 'us',
+        alertType: 'market_light_score_drop',
+        parameters: { minDrop: 12 },
       }));
     });
   });
